@@ -1,9 +1,10 @@
 import bpy
-import os
 import json
+from pathlib import Path
 from contextlib import contextmanager
 
 IS_UPDATING = False
+DATA_FILE = Path(__file__).parent / "data" / "global_list_data.json"
 
 @contextmanager
 def prevent_update():
@@ -14,329 +15,376 @@ def prevent_update():
     finally:
         IS_UPDATING = False
 
-DATA_FILE = os.path.join(os.path.dirname(__file__), "data", "global_list_data.json")
+# ==========================================
+# File I/O Helpers
+# ==========================================
+def _read_json():
+    if not DATA_FILE.exists():
+        return []
+    try:
+        with DATA_FILE.open('r', encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        print("警告: JSONファイルが破損しているため、空のリストとして扱います。")
+        return []
 
-def update_list(item_uid, new_name = None, new_data = None):
+def _write_json(data):
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True) # フォルダがない場合の保険
+    with DATA_FILE.open('w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4)
+
+# ==========================================
+# List Management
+# ==========================================
+def update_list(item_uid, new_name=None, new_data=None):
     if IS_UPDATING:
         return
 
-    current_data = []
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r') as f:
-                current_data = json.load(f)
-        except:
-            current_data = []
-    
+    current_data = _read_json()
     found = False
+
     for entry in current_data:
         if entry.get("uid") == item_uid:
             if new_name:
                 entry["name"] = new_name
             if new_data:
-                entry["node_data"] = json.dumps(new_data, separators=(',', ':'))
+                entry["node_data"] = new_data # 辞書としてそのまま保存
             found = True
             break
 
     if found:
-        with open(DATA_FILE, 'w') as f:
-            json.dump(current_data, f, indent=4)
+        _write_json(current_data)
         load_from_json()
-    else:
-        pass
 
 def update_name_in_json(self, context):
     update_list(self.uid, new_name=self.name)
 
 def update_data_in_json(item, data):
-    update_list(item.uid, new_data = data)
+    update_list(item.uid, new_data=data)
 
 def load_from_json():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, 'r') as f:
-                data = json.load(f)
+    data = _read_json()
+    wm = bpy.context.window_manager
 
-            wm = bpy.context.window_manager
-
-            with prevent_update():
-                wm.global_list.clear()
-
-                for d in data:
-                    item = wm.global_list.add()
-                    item.uid = d["uid"]
-                    item.name = d["name"]
-                    item.node_data = d["node_data"]
-
-        except json.JSONDecodeError:
-            print("ファイルの中身は壊れている")
-
-        finally:
-            IS_UPDATING = False
+    with prevent_update():
+        wm.global_list.clear()
+        for d in data:
+            item = wm.global_list.add()
+            item.uid = d.get("uid", "")
+            item.name = d.get("name", "Nodes")
+            
+            node_data_content = d.get("node_data", {})
+            item.node_data = json.dumps(node_data_content) if isinstance(node_data_content, dict) else str(node_data_content)
 
 def store_to_json():
     wm = bpy.context.window_manager
-
     data_list = []
 
     for item in wm.global_list:
-        data = {
+        parsed_node_data = {}
+        if item.node_data:
+            try:
+                parsed_node_data = json.loads(item.node_data)
+            except json.JSONDecodeError:
+                pass
+
+        data_list.append({
             "uid": item.uid,
             "name": item.name,
-            "node_data": item.node_data
+            "node_data": parsed_node_data
+        })
+    
+    _write_json(data_list)
+
+# ==========================================
+# Serialization Helpers
+# ==========================================
+TARGET_PROPS = {
+    "operation", "blend_type", "data_type", "mode", "distribution", 
+    "subsurface_method", "noise_dimensions", "noise_type", "normalize", 
+    "feature", "distance", "use_clamp", "clamp_result", "clamp_factor", 
+    "interpolation", "interpolation_type", "color_mode", "wave_type", 
+    "wave_profile", "rings_direction", "projection", "extension"
+}
+
+def _parse_socket_val(val):
+    """VectorやColorなどの反復可能オブジェクトをリストに変換する安全な関数"""
+    if hasattr(val, '__iter__') and not isinstance(val, str):
+        return list(val)
+    return val
+
+def _serialize_special_node(node):
+    """特殊ノード（ランプ、カーブ、画像、グループ）の個別処理"""
+    if node.bl_idname == 'ShaderNodeValToRGB':
+        ramp = node.color_ramp
+        return {
+            "type": "ramp",
+            "data": {
+                "color_mode": ramp.color_mode,
+                "interpolation": ramp.interpolation,
+                "elements": [{"position": e.position, "color": list(e.color)} for e in ramp.elements]
+            }
+        }
+    
+    elif node.bl_idname in ('ShaderNodeRGBCurve', 'ShaderNodeVectorCurve'):
+        mapping = node.mapping
+        return {
+            "type": "curve",
+            "data": {
+                "clip_min_x": mapping.clip_min_x, "clip_min_y": mapping.clip_min_y,
+                "clip_max_x": mapping.clip_max_x, "clip_max_y": mapping.clip_max_y,
+                "use_clip": mapping.use_clip,
+                "curves": [[{"location": (p.location.x, p.location.y), "handle_type": p.handle_type} 
+                            for p in curve.points] for curve in mapping.curves]
+            }
         }
         
-        data_list.append(data)
+    elif node.bl_idname == 'ShaderNodeTexImage' and node.image:
+        img = node.image
+        return {
+            "type": "image",
+            "data": {
+                "image_name": img.name,
+                "filepath": img.filepath,
+                "color_space": getattr(img.colorspace_settings, "name", "sRGB"),
+                "source": img.source,
+                "alpha_mode": img.alpha_mode
+            }
+        }
+        
+    elif node.type == 'GROUP' and node.node_tree:
+        return {
+            "type": "group",
+            "data": {
+                "tree_name": node.node_tree.name,
+                "tree_type": node.node_tree.bl_idname,
+                "node_data": SerializeNodes(bpy.context, node.node_tree) # 再帰呼び出し
+            }
+        }
+    return None
 
-    
-    with open(DATA_FILE, 'w') as f:
-        json.dump(data_list, f, indent=4)
+# ==========================================
+# Core Serialization / Deserialization
+# ==========================================
+def SerializeNodes(context, childTree=None):
+    tree = childTree or getattr(context.space_data, "edit_tree", None) or context.space_data.node_tree
+    nodes = tree.nodes if childTree else context.selected_nodes
+    sel_names = {n.name for n in nodes} # in検索を高速化するためにSetを利用
 
-def SerializeNodes(context):
-    nodes = context.selected_nodes
-    tree = context.space_data.edit_tree
-    if tree is None:
-        tree = context.space_data.node_tree
+    data = {"nodes": [], "links": []}
 
-    data = {
-        "node": [],
-        "links": []
-    }
+    # Groupのインターフェース保存
+    if childTree and hasattr(tree, "interface"):
+        data["interface"] = {"inputs": [], "outputs": []}
+        for item in getattr(tree.interface, "items_tree", []):
+            if item.item_type != 'SOCKET': continue
+            
+            sock_data = {
+                "name": item.name, 
+                "type": item.socket_type, 
+                "default_value": _parse_socket_val(getattr(item, "default_value", None))
+            }
+            if item.in_out == 'INPUT': data["interface"]["inputs"].append(sock_data)
+            elif item.in_out == 'OUTPUT': data["interface"]["outputs"].append(sock_data)
 
-    sel_names = [n.name for n in nodes]
-
-    target_props = [
-        "operation",        # Math, Vector Math, Boolean
-        "blend_type",       # Mix Node
-        "data_type",        # Mix Node (Float/Vector/Color...)
-        "mode",             # Map Range
-        "distribution",     # Brick Texture, Voronoi
-        "subsurface_method", # Principled BSDF
-        "noise_dimensions", # Noise Texture (2D/3D/4D)
-        "noise_type",       # Noise Texture (fBM...)
-        "normalize",        # Noise Texture (normalize)
-        "feature",          # Voronoi (F1, F2...)
-        "distance",         # Voronoi (Euclidean...)
-        "use_clamp",        # Math Node Checkbox
-        "clamp_result",     # Mix Node Checkbox
-        "clamp_factor",     # Mix Node Checkbox (Old)
-        "interpolation_type", # Map Range
-        "color_mode",       # Gradient Texture
-        "wave_type",        # Wave Texture
-        "wave_profile",     # Wave Texture
-        "rings_direction",  # Wave Texture
-    ]
-
+    # ノード情報の取得
     for node in nodes:
         node_data = {
             "name": node.name,
-            "id": node.bl_idname,
+            "type": node.bl_idname,
             "location": (node.location.x, node.location.y),
             "width": node.width,
-            "inputs": [],
-            "properties": {}
+            "properties": {p: getattr(node, p) for p in TARGET_PROPS if hasattr(node, p)},
+            "inputs": [{"index": i, "value": _parse_socket_val(s.default_value)} 
+                       for i, s in enumerate(node.inputs) if not s.is_linked and hasattr(s, "default_value")],
+            "outputs": [{"index": i, "value": _parse_socket_val(s.default_value)} 
+                        for i, s in enumerate(node.outputs) if hasattr(s, "default_value")]
         }
+        
+        special = _serialize_special_node(node)
+        if special:
+            node_data["special_data"] = special
+            
+        data["nodes"].append(node_data)
 
-        for prop_name in target_props:
-            if hasattr(node, prop_name):
-                val = getattr(node, prop_name)
-                node_data["properties"][prop_name] = val
-
-        for i, sock in enumerate(node.inputs):
-            if not sock.is_linked and hasattr(sock, "default_value"):
-                val = sock.default_value
-
-                try:
-                    val = list(val)
-                except:
-                    pass
-
-                node_data["inputs"].append({"index": i, "value": val})
-
-        if node.bl_idname == 'ShaderNodeValToRGB':
-            ramp = node.color_ramp
-            ramp_data = {
-                "color_mode": ramp.color_mode,
-                "interpolation": ramp.interpolation,
-                "elements": []
-            }
-            for elt in ramp.elements:
-                ramp_data["elements"].append({
-                    "position": elt.position,
-                    "color": list(elt.color)
-                })
-            node_data["special_data"] = {
-                "type": "ramp",
-                "data": ramp_data
-            }
-        elif node.bl_idname in ('ShaderNodeRGBCurve', 'ShaderNodeVectorCurve'):
-            curve_mapping = node.mapping
-            curve_data = {
-                "curves": []
-            }
-
-            for curve in curve_mapping.curves:
-                point_data = []
-                for p in curve.points:
-                    point_data.append({
-                        "location": (p.location.x, p.location.y),
-                        "handle_type": p.handle_type
-                    })
-                curve_data["curves"].append(point_data)
-
-            curve_data["clip_min_x"] = curve_mapping.clip_min_x
-            curve_data["clip_min_y"] = curve_mapping.clip_min_y
-            curve_data["clip_max_x"] = curve_mapping.clip_max_x
-            curve_data["clip_max_y"] = curve_mapping.clip_max_y
-            curve_data["use_clip"] = curve_mapping.use_clip
-                
-            node_data["special_data"] = {
-                "type": "curve",
-                "data": curve_data
-            }
-
-        data["node"].append(node_data)
-    
-
+    # リンク情報の取得
     for link in tree.links:
         if link.from_node.name in sel_names and link.to_node.name in sel_names:
-            link_data = {
-                "from_node": link.from_node.name,
-                "from_socket_index": -1,
-                "to_node": link.to_node.name,
-                "to_socket_index": -1
-            }
-
-            for i, sock in enumerate(link.from_node.outputs):
-                if sock == link.from_socket:
-                    link_data["from_socket_index"] = i
-                    break
+            from_idx = next((i for i, s in enumerate(link.from_node.outputs) if s == link.from_socket), -1)
+            to_idx = next((i for i, s in enumerate(link.to_node.inputs) if s == link.to_socket), -1)
             
-            for i, sock in enumerate(link.to_node.inputs):
-                if sock == link.to_socket:
-                    link_data["to_socket_index"] = i
-                    break
-            
-            data["links"].append(link_data)
+            if from_idx != -1 and to_idx != -1:
+                data["links"].append({
+                    "from_node": link.from_node.name,
+                    "from_socket_index": from_idx,
+                    "to_node": link.to_node.name,
+                    "to_socket_index": to_idx
+                })
 
     return data
 
+# ==========================================
+# Deserialization Helpers (Internal)
+# ==========================================
 
-def DeserializeNodes(context, data):
-    tree = context.space_data.edit_tree
-    if tree is None:
-        tree = context.space_data.node_tree
+def _restore_socket_values(node, data_list, socket_type='inputs'):
+    """ソケットのデフォルト値を復元する"""
+    sockets = getattr(node, socket_type)
+    for s_data in data_list:
+        idx = s_data.get("index")
+        val = s_data.get("value")
+        if idx is not None and idx < len(sockets):
+            try:
+                sockets[idx].default_value = val
+            except Exception:
+                pass
 
-    for n in tree.nodes:
-        n.select = False
+def _restore_color_ramp(node, s_data):
+    """ColorRamp（カラーランプ）の復元"""
+    ramp = getattr(node, "color_ramp", None)
+    if not ramp: return
+    
+    ramp.color_mode = s_data.get("color_mode", 'RGB')
+    ramp.interpolation = s_data.get("interpolation", 'LINEAR')
+    
+    elements = s_data.get("elements", [])
+    # 要素数を合わせる
+    while len(ramp.elements) < len(elements): ramp.elements.new(1.0)
+    while len(ramp.elements) > len(elements): ramp.elements.remove(ramp.elements[-1])
+    
+    for i, e_data in enumerate(elements):
+        ramp.elements[i].position = e_data["position"]
+        ramp.elements[i].color = e_data["color"]
+
+def _restore_curves(node, s_data):
+    """RGB/Vector Curve（カーブ）の復元"""
+    mapping = getattr(node, "mapping", None)
+    if not mapping: return
+    
+    mapping.clip_min_x = s_data.get("clip_min_x", 0.0)
+    mapping.clip_min_y = s_data.get("clip_min_y", 0.0)
+    mapping.clip_max_x = s_data.get("clip_max_x", 1.0)
+    mapping.clip_max_y = s_data.get("clip_max_y", 1.0)
+    mapping.use_clip = s_data.get("use_clip", False)
+    
+    for i, p_list in enumerate(s_data.get("curves", [])):
+        if i >= len(mapping.curves): break
+        curve = mapping.curves[i]
+        # 点の数を合わせる
+        while len(curve.points) < len(p_list): curve.points.new(0.0, 0.0)
+        while len(curve.points) > len(p_list): curve.points.remove(curve.points[-1])
+        
+        for j, p_data in enumerate(p_list):
+            p = curve.points[j]
+            p.location = p_data["location"]
+            p.handle_type = p_data.get("handle_type", 'AUTO')
+    
+    if hasattr(mapping, "update"): mapping.update()
+
+def _restore_image(self, node, s_data):
+    """Image Texture（画像）の復元"""
+    img_name = s_data.get("image_name")
+    filepath = s_data.get("filepath", "")
+    
+    image = bpy.data.images.get(img_name) if img_name else None
+    
+    if not image and filepath:
+        try:
+            image = bpy.data.images.load(filepath, check_existing=True)
+        except RuntimeError:
+            self.report({'WARNING'}, f"画像のロードに失敗: {filepath}")
+            
+    if image:
+        node.image = image
+        if "color_space" in s_data and hasattr(image, "colorspace_settings"):
+            image.colorspace_settings.name = s_data["color_space"]
+
+def _restore_node_group(self, context, node, s_data):
+    """Node Group（グループ）の復元と再帰的展開"""
+    tree_name = s_data.get("tree_name")
+    if not tree_name: return
+    
+    group = bpy.data.node_groups.get(tree_name)
+    if not group:
+        # 新規グループ作成とインターフェース構築
+        group_type = s_data.get("tree_type", "ShaderNodeTree")
+        group = bpy.data.node_groups.new(name=tree_name, type=group_type)
+        
+        inner_data = s_data.get("node_data", {})
+        interface = inner_data.get("interface", {})
+        
+        if hasattr(group, "interface"):
+            for sock in interface.get("inputs", []):
+                s = group.interface.new_socket(name=sock["name"], in_out='INPUT', socket_type=sock["type"])
+                if "default_value" in sock and hasattr(s, "default_value"):
+                    s.default_value = sock["default_value"]
+            for sock in interface.get("outputs", []):
+                group.interface.new_socket(name=sock["name"], in_out='OUTPUT', socket_type=sock["type"])
+        
+        # 再帰的に中身を展開
+        DeserializeNodes(self, context, inner_data, iTree=group)
+        
+    node.node_tree = group
+
+# ==========================================
+# Main Deserialization Function
+# ==========================================
+
+def DeserializeNodes(self, context, data, iTree=None):
+    # ツリーの決定
+    tree = iTree or getattr(context.space_data, "edit_tree", None) or context.space_data.node_tree
+    if not tree: return {'CANCELLED'}
+
+    # 既存の選択を解除
+    for n in tree.nodes: n.select = False
 
     node_map = {}
+    node_list = data.get("nodes", [])
 
-    node_list = data.get("node", [])
-
+    # 1. ノードの作成と基本プロパティの復元
     for n_data in node_list:
-        new_node = tree.nodes.new(n_data["id"])
-        new_node.location = n_data["location"]
-        new_node.width = n_data["width"]
-        new_node.select = True
+        try:
+            new_node = tree.nodes.new(n_data["type"])
+        except RuntimeError:
+            self.report({'ERROR'}, f"ノードタイプが見つかりません: {n_data['type']}")
+            continue
 
+        new_node.location = n_data.get("location", (0, 0))
+        new_node.width = n_data.get("width", 140)
+        new_node.select = True
         node_map[n_data["name"]] = new_node
 
-        for prop, val in n_data["properties"].items():
+        # 基本プロパティの一括復元
+        for prop, val in n_data.get("properties", {}).items():
             if hasattr(new_node, prop):
-                try:
-                    setattr(new_node,prop,val)
-                except:
-                    print(f"Property Error: {prop}")
-        
-        for inp in n_data["inputs"]:
-            idx = inp["index"]
-            val = inp["value"]
+                try: setattr(new_node, prop, val)
+                except Exception: pass
 
-            if idx < len(new_node.inputs):
-                try:
-                    new_node.inputs[idx].default_value = val
-                except:
-                    pass
+        # ソケット値の復元
+        _restore_socket_values(new_node, n_data.get("inputs", []), 'inputs')
+        _restore_socket_values(new_node, n_data.get("outputs", []), 'outputs')
 
+        # 特殊データの復元（切り出した関数へ委譲）
         special = n_data.get("special_data")
-
         if special:
-            sType = special["type"]
-            sData = special["data"]
+            stype = special.get("type")
+            sdata = special.get("data", {})
+            if stype == "ramp": _restore_color_ramp(new_node, sdata)
+            elif stype == "curve": _restore_curves(new_node, sdata)
+            elif stype == "image": _restore_image(self, new_node, sdata)
+            elif stype == "group": _restore_node_group(self, context, new_node, sdata)
 
-            if sType == "ramp" and hasattr(new_node, "color_ramp"):
-                ramp = new_node.color_ramp
-                ramp.color_mode = sData.get("color_mode", 'RGB')
-                ramp.interpolation = sData.get("interpolation", 'LINEAR')
-
-                elements_data = sData.get("elements", [])
-
-                current_len = len(ramp.elements)
-                target_len = len(elements_data)
-
-                if current_len < target_len:
-                    for _ in range(target_len - current_len):
-                        ramp.elements.new(1.0)
-                elif current_len > target_len:
-                    for i in range(current_len - 1 , target_len - 1, -1):
-                        ramp.elements.remove(ramp.elements[i])
-
-                for i, elt_d in enumerate(elements_data):
-                    elt = ramp.elements[i]
-                    elt.position = elt_d["position"]
-                    elt.color = elt_d["color"]
-
-            elif sType == "curve" and hasattr(new_node, "mapping"):
-                mapping = new_node.mapping
-                mapping.clip_min_x = sData.get("clip_min_x", 0.0)
-                mapping.clip_min_y = sData.get("clip_min_y", 0.0)
-                mapping.clip_max_x = sData.get("clip_max_x", 1.0)
-                mapping.clip_max_y = sData.get("clip_max_y", 1.0)
-                mapping.use_clip = sData.get("use_clip", False)
-
-                saved_curve = sData.get("curves", [])
-
-                for i, points_list in enumerate(saved_curve):
-                    if i >= len(mapping.curves):
-                        break
-
-                    curve = mapping.curves[i]
-
-                    target_len = len(points_list)
-                    current_len = len(curve.points)
-
-                    if target_len > current_len:
-                        for _ in range(target_len - current_len):
-                            curve.points.new(0.0, 0.0)
-                    elif target_len < current_len:
-                         for k in range(current_len - 1, target_len - 1, -1):
-                            curve.points.remove(curve.points[k])
-
-                    for j, p_data in enumerate(points_list):
-                        p = curve.points[j]
-                        p.location.x = p_data["location"][0]
-                        p.location.y = p_data["location"][1]
-                        p.handle_type = p_data.get("handle_type", 'AUTO')
-
-                if hasattr(mapping, "update"):
-                    mapping.update()
-
-    
-
-    for l_data in data["links"]:
+    # 2. リンクの復元
+    for l_data in data.get("links", []):
         try:
-            node_from = node_map[l_data["from_node"]]
-            node_to = node_map[l_data["to_node"]]
+            node_from = node_map.get(l_data["from_node"])
+            node_to = node_map.get(l_data["to_node"])
+            if not node_from or not node_to: continue
 
             socket_out = node_from.outputs[l_data["from_socket_index"]]
             socket_in = node_to.inputs[l_data["to_socket_index"]]
-
             tree.links.new(socket_out, socket_in)
-
-        except KeyError:
-            print("Link Error: Node mapping failed")
-        except IndexError:
-            print("Link Error: Socket index mismatch")
+        except (IndexError, KeyError):
+            pass
 
     return {'FINISHED'}

@@ -14,7 +14,6 @@ bl_info = {
 
 import bpy
 import importlib
-import uuid
 from . import util
 from . import ui
 from . import operator
