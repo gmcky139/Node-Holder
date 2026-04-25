@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Node Holder",
     "author": "gmcky139",
-    "version": (1, 0, 0),
+    "version": (1, 0, 1),
     "blender": (4, 5, 0),
     "location": "Node Editor > Sidebar > Node Holder",
     "description": "Save selected nodes with connections and data for reuse across blend files.",
