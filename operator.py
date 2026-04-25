@@ -102,7 +102,7 @@ class MY_OT_RegisterItem(bpy.types.Operator):
             item = context.window_manager.global_list.add()
             item.uid = str(uuid.uuid4())
             item.name = "Nodes"
-            item.node_data = json.dumps(data)
+            item.node_data = json.dumps(data, default=util.json_fallback)
             util.store_to_json()
 
             self.report({'INFO'}, "Successfully saved selected nodes as a new item")

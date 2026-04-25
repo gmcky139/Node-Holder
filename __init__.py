@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Node Holder",
     "author": "gmcky139",
-    "version": (1, 0, 0),
+    "version": (1, 0, 2),
     "blender": (4, 5, 0),
     "location": "Node Editor > Sidebar > Node Holder",
     "description": "Save selected nodes with connections and data for reuse across blend files.",
@@ -17,6 +17,19 @@ import importlib
 from . import util
 from . import ui
 from . import operator
+
+if "bpy" in locals():
+    # 2回目以降の読み込み（チェックのオンオフ時や上書き時）はメモリから強制リロードする
+    import importlib
+    importlib.reload(util)
+    importlib.reload(ui)
+    importlib.reload(operator)
+else:
+    # 初回読み込み時
+    import bpy
+    from . import util
+    from . import ui
+    from . import operator
 
 
 class GlobalItem(bpy.types.PropertyGroup):

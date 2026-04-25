@@ -2,6 +2,7 @@ import bpy
 import json
 from pathlib import Path
 from contextlib import contextmanager
+import mathutils
 
 IS_UPDATING = False
 DATA_FILE = Path(__file__).parent / "data" / "global_list_data.json"
@@ -31,7 +32,7 @@ def _read_json():
 def _write_json(data):
     DATA_FILE.parent.mkdir(parents=True, exist_ok=True) # フォルダがない場合の保険
     with DATA_FILE.open('w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4)
+        json.dump(data, f, indent=4, default=json_fallback)
 
 # ==========================================
 # List Management
@@ -95,6 +96,21 @@ def store_to_json():
         })
     
     _write_json(data_list)
+
+def json_fallback(obj):
+    """JSONが理解できない型（Vector, Colorなど）に遭遇した時の自動変換関数"""
+    
+    # BlenderのVector, Color, Euler, Matrix ならリストに変換
+    if isinstance(obj, (mathutils.Vector, mathutils.Color, mathutils.Euler, mathutils.Matrix)):
+        return list(obj)
+    
+    # その他の反復可能オブジェクトも念のためリスト化
+    if hasattr(obj, '__iter__') and not isinstance(obj, str):
+        return list(obj)
+    
+    # どうしても変換できない未知の型は、エラーで落ちるのを防ぐため文字列にする
+    return str(obj)
+
 
 # ==========================================
 # Serialization Helpers
@@ -194,7 +210,7 @@ def SerializeNodes(context, childTree=None):
             "type": node.bl_idname,
             "location": (node.location.x, node.location.y),
             "width": node.width,
-            "properties": {p: getattr(node, p) for p in TARGET_PROPS if hasattr(node, p)},
+            "properties": {p: _parse_socket_val(getattr(node, p)) for p in TARGET_PROPS if hasattr(node, p)},
             "inputs": [{"index": i, "value": _parse_socket_val(s.default_value)} 
                        for i, s in enumerate(node.inputs) if not s.is_linked and hasattr(s, "default_value")],
             "outputs": [{"index": i, "value": _parse_socket_val(s.default_value)} 
