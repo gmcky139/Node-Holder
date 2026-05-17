@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Node Holder",
     "author": "gmcky139",
-    "version": (1, 0, 2),
+    "version": (1, 0, 3),
     "blender": (4, 5, 0),
     "location": "Node Editor > Sidebar > Node Holder",
     "description": "Save selected nodes with connections and data for reuse across blend files.",
@@ -14,6 +14,7 @@ bl_info = {
 
 import bpy
 import importlib
+from bpy.app.handlers import persistent
 from . import util
 from . import ui
 from . import operator
@@ -58,6 +59,11 @@ classes = [
     ui.NODE_PT_my_panel
 ]
 
+@persistent
+def load_handler(dummy):
+    """別の.blendファイルを開いた時に自動でJSONからデータを読み込む"""
+    util.load_from_json()
+
 def register():
     for c in classes:
         bpy.utils.register_class(c)
@@ -66,9 +72,13 @@ def register():
     bpy.types.WindowManager.global_list_index = bpy.props.IntProperty()
 
     util.load_from_json()
+    
+    if load_handler not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(load_handler)
 
 def unregister():
-    util.store_to_json()
+    if load_handler in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(load_handler)
 
     del bpy.types.WindowManager.global_list
     del bpy.types.WindowManager.global_list_index
